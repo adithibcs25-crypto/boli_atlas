@@ -132,6 +132,7 @@
       form.append('audio', audio, audio.name);
       form.append('language_code', languageCode);
       form.append('format', formatInput.value);
+      form.append('csrf_token', document.querySelector('#contribution-form [name=csrf_token]').value);
       transcribeStatus.textContent = 'Sending audio securely to Gnani Prisma v3.0…';
       const response = await fetch('/api/transcribe', {method: 'POST', body: form});
       const data = await response.json();

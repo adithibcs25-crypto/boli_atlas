@@ -1,23 +1,43 @@
 import os
-import uuid
 import wave
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Flask, abort, flash, jsonify, redirect, render_template, request, send_from_directory, url_for
+from flask import Flask, abort, flash, jsonify, redirect, render_template, request, send_file, url_for
+from flask_wtf.csrf import CSRFProtect, CSRFError
+from io import BytesIO
 from werkzeug.exceptions import BadRequest
 from mutagen import File as MutagenFile, MutagenError
 from dotenv import load_dotenv
-from werkzeug.utils import secure_filename
 
 load_dotenv()
 
 from config import Config
 from database import close_db, get_db, init_db, list_phrases, get_phrase
 from gnani_api import GnaniError, transcribe
+from audio_storage import delete_audio, read_audio, store_audio
 
 app = Flask(__name__)
 app.config.from_object(Config)
+IS_PRODUCTION = bool(os.environ.get('RENDER')) or os.environ.get('FLASK_ENV', '').lower() == 'production'
+if IS_PRODUCTION:
+    missing = [name for name, configured in (
+        ('GNANI_API_KEY', app.config['GNANI_API_KEY']),
+        ('SUPABASE_URL', app.config['SUPABASE_URL']),
+        ('SUPABASE_SECRET_KEY', app.config['SUPABASE_SECRET_KEY']),
+        ('DATABASE_URL', app.config['DATABASE_URL']),
+        ('FLASK_SECRET_KEY', os.environ.get('FLASK_SECRET_KEY', '').strip()),
+    ) if not configured]
+    if missing:
+        raise RuntimeError('Missing required production environment variables: ' + ', '.join(missing))
+    if app.config['SECRET_KEY'] == 'local-development-change-me':
+        raise RuntimeError('FLASK_SECRET_KEY must be set to a secure random value in production.')
+    if not app.config['SUPABASE_SECRET_KEY'].startswith('sb_secret_'):
+        raise RuntimeError('SUPABASE_SECRET_KEY must use Supabase’s sb_secret_ format.')
+    if any(value in app.config['DATABASE_URL'] for value in ('[YOUR-PASSWORD]', '[PASSWORD]', 'YOUR_PASSWORD')):
+        raise RuntimeError('DATABASE_URL still contains a password placeholder; replace it with the Supabase database password.')
+    app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax')
+csrf = CSRFProtect(app)
 app.teardown_appcontext(close_db)
 Path(app.config['UPLOAD_FOLDER']).mkdir(parents=True, exist_ok=True)
 with app.app_context():
@@ -37,6 +57,15 @@ def globals_for_templates():
 def index():
     phrases = list_phrases(limit=8)
     return render_template('index.html', phrases=phrases)
+
+@app.get('/healthz')
+def healthz():
+    try:
+        get_db().execute('SELECT 1').fetchone()
+        return jsonify(status='ok'), 200
+    except Exception as exc:
+        app.logger.error('Health check failed while querying the database (%s).', type(exc).__name__)
+        return jsonify(status='unavailable'), 503
 
 @app.get('/explore')
 def explore():
@@ -140,20 +169,45 @@ def save_contribution():
         if error:
             app.logger.warning('Contribution rejected during audio validation: %s', error)
             flash(error, 'error'); return redirect(url_for('contribute'))
-        ext = Path(secure_filename(audio.filename)).suffix.lower()
-        filename = f'{uuid.uuid4().hex}{ext}'
-        audio.save(Path(app.config['UPLOAD_FOLDER']) / filename)
-        audio_path = filename
-    with get_db() as db:
-        db.execute('''INSERT INTO phrases (phrase,transliteration,language,region,literal_meaning,contextual_meaning,example_usage,cultural_note,tags,audio_path,contributor,raw_transcript,corrected_transcript,model_used,verification_status,detected_language_code,transcription_request_id,transcription_timestamp,transcription_mode)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (data['phrase'].strip(),data.get('transliteration','').strip(),data['language'],data['region'].strip(),data.get('literal_meaning','').strip(),data['contextual_meaning'].strip(),data.get('example_usage','').strip(),data.get('cultural_note','').strip(),data.get('tags','').strip(),audio_path,data.get('contributor','').strip() or 'Anonymous',data.get('raw_transcript','').strip(),data['corrected_transcript'].strip(),data.get('model_used','').strip() or None,'Pending review',data.get('detected_language_code','').strip() or None,data.get('transcription_request_id','').strip() or None,data.get('transcription_timestamp','').strip() or None,data.get('transcription_mode','').strip() or None))
+        try:
+            audio_path = store_audio(audio)
+        except Exception as exc:
+            app.logger.error('Contribution failed during audio storage upload (%s).', type(exc).__name__)
+            flash('We could not store your recording. Please try again in a moment.', 'error')
+            return redirect(url_for('contribute'))
+    consent = data.get('audio_public_consent') == 'yes'
+    try:
+        with get_db() as db:
+            db.execute('''INSERT INTO phrases (phrase,transliteration,language,region,literal_meaning,contextual_meaning,example_usage,cultural_note,tags,audio_path,contributor,raw_transcript,corrected_transcript,model_used,verification_status,detected_language_code,transcription_request_id,transcription_timestamp,transcription_mode,audio_public_consent)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (data['phrase'].strip(),data.get('transliteration','').strip(),data['language'],data['region'].strip(),data.get('literal_meaning','').strip(),data['contextual_meaning'].strip(),data.get('example_usage','').strip(),data.get('cultural_note','').strip(),data.get('tags','').strip(),audio_path,data.get('contributor','').strip() or 'Anonymous',data.get('raw_transcript','').strip(),data['corrected_transcript'].strip(),data.get('model_used','').strip() or None,'Pending review',data.get('detected_language_code','').strip() or None,data.get('transcription_request_id','').strip() or None,data.get('transcription_timestamp','').strip() or None,data.get('transcription_mode','').strip() or None,consent))
+    except Exception as exc:
+        app.logger.error('Contribution failed while saving the phrase record (%s).', type(exc).__name__)
+        if audio_path:
+            try:
+                delete_audio(audio_path)
+            except Exception as exc:
+                app.logger.error('Contribution cleanup could not remove an unlinked audio object (%s).', type(exc).__name__)
+        flash('We could not save your Phrase Passport. Your recording was not attached; please try again.', 'error')
+        return redirect(url_for('contribute'))
     flash('Your Phrase Passport was saved and is pending community review.', 'success')
     return redirect(url_for('explore'))
 
 @app.get('/uploads/<path:filename>')
 def uploaded_audio(filename):
-    if Path(filename).name != filename: abort(404)
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename, as_attachment=False)
+    # The public phrase page only exposes audio when a contributor explicitly consented.
+    row = get_db().execute('SELECT audio_path,audio_public_consent FROM phrases WHERE audio_path=?', (filename,)).fetchone()
+    if not row or not row['audio_public_consent']:
+        abort(404)
+    try:
+        content = read_audio(row['audio_path'])
+    except Exception as exc:
+        app.logger.error('Audio retrieval failed for an opted-in recording (%s).', type(exc).__name__)
+        abort(503)
+    if content is None:
+        abort(404)
+    ext = Path(filename).suffix.lower()
+    mimetype = {'.wav':'audio/wav','.mp3':'audio/mpeg','.m4a':'audio/mp4','.webm':'audio/webm','.ogg':'audio/ogg','.flac':'audio/flac','.aac':'audio/aac'}.get(ext, 'application/octet-stream')
+    return send_file(BytesIO(content), mimetype=mimetype, as_attachment=False, download_name=Path(filename).name, max_age=300)
 
 @app.get('/about')
 def about(): return render_template('about.html')
@@ -168,6 +222,17 @@ def too_large(_):
         return redirect(url_for('contribute'))
     return 'Audio must be no larger than 15 MB.', 413
 
+@app.errorhandler(CSRFError)
+def csrf_error(_error):
+    app.logger.warning('Request rejected by CSRF validation at route %s.', request.path)
+    message = 'This form expired or could not be verified. Reload the page and try again.'
+    if request.path.startswith('/api/'):
+        return jsonify(error=message), 400
+    if request.path == '/contribute':
+        flash(message, 'error')
+        return redirect(url_for('contribute'))
+    return message, 400
+
 
 @app.errorhandler(BadRequest)
 def bad_request(error):
@@ -181,4 +246,4 @@ def bad_request(error):
     return error
 
 if __name__ == '__main__':
-    app.run(debug=os.environ.get('FLASK_DEBUG') == '1')
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', '5000')), debug=not IS_PRODUCTION and os.environ.get('FLASK_DEBUG') == '1')
